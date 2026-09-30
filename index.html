@@ -346,10 +346,14 @@ You can use this application to listen to your school notes, revision notes and 
                 The first time you use a voice it downloads once (about 60 MB); after that it works offline.
             </p>
 
+            <label for="mp3Title" style="font-weight:bold;display:block;margin-bottom:7px">Title of the recording</label>
+            <input id="mp3Title" type="text" maxlength="80" placeholder="Taken from the first line of your notes" style="margin-bottom:12px">
+
             <div class="export-row">
                 <select id="studioVoice" aria-label="Studio voice for MP3"></select>
 
                 <button class="primary" id="mp3Button" onclick="downloadAudio()">⬇ Create MP3</button>
+                <button class="stop" id="cancelButton" onclick="cancelAudio()" hidden>✕ Cancel</button>
             </div>
 
             <progress id="progress" max="100" value="0" hidden></progress>
@@ -801,16 +805,19 @@ updateCount();
 ===================================== -->
 <script type="module">
 
-const TTS_URL  = "https://cdn.jsdelivr.net/npm/@diffusionstudio/vits-web@1/+esm";
+// Piper engine that keeps the voice loaded between pieces (much faster than reloading it each time)
+const TTS_URL  = "https://cdn.jsdelivr.net/npm/@mintplex-labs/piper-tts-web@1.0.4/+esm";
 const LAME_URL = "https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js";
 
 const mp3Button   = document.getElementById("mp3Button");
+const cancelButton = document.getElementById("cancelButton");
 const studioVoice = document.getElementById("studioVoice");
 const progressBar = document.getElementById("progress");
 const result      = document.getElementById("result");
 const statusBox   = document.getElementById("status");
 
-let ttsLib = null;
+let engine = null;          // background voice engine
+let cancelled = false;
 let lastUrl = null;
 
 function setStatus(message) { statusBox.textContent = message; }
@@ -823,11 +830,364 @@ function setProgress(value) {
 const nextFrame = () => new Promise(r => setTimeout(r, 0));
 
 
+/* ---------- FFmpeg-style finishing: loudness, Info header, ID3 tag ---------- */
+
+const TARGET_RMS_DB = -15;               // speech level that lands near -16 LUFS
+
+function crc16(bytes, start, end) {            // CRC-16/ARC, as used by the LAME tag
+    let crc = 0;
+    for (let i = start; i < end; i++) {
+        crc ^= bytes[i];
+        for (let b = 0; b < 8; b++) crc = (crc & 1) ? (crc >>> 1) ^ 0xA001 : crc >>> 1;
+    }
+    return crc & 0xFFFF;
+}
+
+const MPEG2_L3_BITRATES = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+const MPEG2_RATES = [22050, 24000, 16000];
+
+function countFrames(audio) {                   // walk the MPEG-2 layer III frames
+    let pos = 0, frames = 0;
+    while (pos + 4 <= audio.length) {
+        if (audio[pos] !== 0xFF || (audio[pos + 1] & 0xE0) !== 0xE0) break;
+        const bitrate = MPEG2_L3_BITRATES[audio[pos + 2] >> 4] * 1000;
+        const rate = MPEG2_RATES[(audio[pos + 2] >> 2) & 3];
+        const padding = (audio[pos + 2] >> 1) & 1;
+        if (!bitrate || !rate) break;
+        pos += Math.floor(72 * bitrate / rate) + padding;
+        frames++;
+    }
+    return frames;
+}
+
+/* Builds the "Info" header frame (Xing/LAME format), exactly the layout FFmpeg writes */
+function buildInfoFrame(audio, sampleRate) {
+    const FRAME = 192;                          // 64 kbps frame at 24 kHz: room for the full LAME tag
+    const f = new Uint8Array(FRAME);
+    const rateIndex = MPEG2_RATES.indexOf(sampleRate);
+    f[0] = 0xFF; f[1] = 0xF3;                   // MPEG-2, layer III, no CRC
+    f[2] = (8 << 4) | (rateIndex << 2);         // 64 kbps, sample rate
+    f[3] = 0xC0;                                // mono
+    const put32 = (o, v) => { f[o] = v >>> 24; f[o + 1] = (v >>> 16) & 255; f[o + 2] = (v >>> 8) & 255; f[o + 3] = v & 255; };
+
+    const frames = countFrames(audio);
+    const totalBytes = FRAME + audio.length;
+    const frameBytes = audio.length / Math.max(frames, 1);
+
+    let o = 4 + 9;                              // after header + mono side info
+    f.set([73, 110, 102, 111], o);              // "Info" (CBR)
+    put32(o + 4, 0x0F);                         // frames + bytes + TOC + quality present
+    put32(o + 8, frames);
+    put32(o + 12, totalBytes);
+    for (let i = 0; i < 100; i++) {             // seek table
+        const pos = FRAME + Math.floor(Math.floor(i / 100 * frames) * frameBytes);
+        f[o + 16 + i] = Math.min(255, Math.floor(pos * 256 / totalBytes));
+    }
+    put32(o + 116, 0);                          // quality
+    o += 120;                                   // = 133, LAME extension
+    const enc = "LAME3.99r";
+    for (let i = 0; i < 9; i++) f[o + i] = enc.charCodeAt(i);
+    // 142..153 revision, lowpass, replay gain, flags: left 0 (as FFmpeg does)
+    f[153] = 48;                                // bitrate (kbps)
+    // 154..156 encoder delay / padding = 0 (no gapless trimming)
+    put32(161, totalBytes);                     // music length
+    const musicCrc = crc16(audio, 0, audio.length);
+    f[165] = musicCrc >> 8; f[166] = musicCrc & 255;
+    const tagCrc = crc16(f, 0, 167);            // LAME tag CRC (mono MPEG-2 layout)
+    f[167] = tagCrc >> 8; f[168] = tagCrc & 255;
+    return f;
+}
+
+/* Builds an ID3v2.4 tag with UTF-8 text frames */
+function buildId3(fields) {
+    const utf8 = s => new TextEncoder().encode(s);
+    const synchsafe = n => [(n >> 21) & 127, (n >> 14) & 127, (n >> 7) & 127, n & 127];
+    const frames = [];
+    for (const [id, value] of Object.entries(fields)) {
+        if (!value) continue;
+        const body = utf8(value);
+        const fr = new Uint8Array(10 + 1 + body.length);
+        fr.set(utf8(id), 0);
+        fr.set(synchsafe(body.length + 1), 4);
+        fr[10] = 3;                             // UTF-8
+        fr.set(body, 11);
+        frames.push(fr);
+    }
+    const size = frames.reduce((s, fr) => s + fr.length, 0);
+    const tag = new Uint8Array(10 + size);
+    tag.set([73, 68, 51, 4, 0, 0], 0);          // "ID3" v2.4.0
+    tag.set(synchsafe(size), 6);
+    let o = 10;
+    frames.forEach(fr => { tag.set(fr, o); o += fr.length; });
+    return tag;
+}
+
+/* Loudness: bring speech to about -16 LUFS with a soft peak limiter */
+function normalizeSpeech(samples, sampleRate) {
+    const block = Math.round(sampleRate * 0.05);
+    let sum = 0, count = 0;
+    for (let i = 0; i + block <= samples.length; i += block) {
+        let s = 0;
+        for (let j = i; j < i + block; j++) s += samples[j] * samples[j];
+        const rms = Math.sqrt(s / block);
+        if (rms > 0.003) { sum += s; count += block; }  // skip silence (below about -50 dB)
+    }
+    if (!count) return samples;
+    const rmsDb = 10 * Math.log10(sum / count);
+    const gain = Math.pow(10, (TARGET_RMS_DB - rmsDb) / 20);
+
+    // Smooth look-ahead peak limiter (no distortion): ceiling about -3.3 dBFS
+    const ceiling = 0.68, L = Math.round(sampleRate * 0.005);
+    const n = samples.length;
+    const need = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+        const a = Math.abs(samples[i] * gain);
+        need[i] = a > ceiling ? ceiling / a : 1;
+    }
+    // sliding minimum over [i-L, i+L]
+    const mins = new Float32Array(n), dq = new Int32Array(n);
+    let head = 0, tail = 0;
+    for (let i = 0; i < n + L; i++) {
+        if (i < n) {
+            while (tail > head && need[dq[tail - 1]] >= need[i]) tail--;
+            dq[tail++] = i;
+        }
+        const c = i - L;
+        if (c >= 0) {
+            while (dq[head] < c - L) head++;
+            mins[c] = need[dq[head]];
+        }
+    }
+    // moving average over the same width keeps the gain smooth and never above the needed gain
+    const m = j => (j >= 0 && j < n) ? mins[j] : 1;
+    const out = new Float32Array(n);
+    const W = 2 * L + 1;
+    let sumG = 0;
+    for (let j = -L; j <= L; j++) sumG += m(j);
+    for (let i = 0; i < n; i++) {
+        out[i] = samples[i] * gain * (sumG / W);
+        sumG += m(i + L + 1) - m(i - L);
+    }
+    return out;
+}
+
+
+
+
 /* ---------- Load the libraries only when needed ---------- */
 
-async function loadTTS() {
-    if (!ttsLib) ttsLib = await import(TTS_URL);
-    return ttsLib;
+/* ---------- Voice engine ----------
+   Runs in a background worker so the page never freezes, and keeps the
+   voice loaded between pieces. Falls back to the page itself if a worker
+   can't start on this browser. */
+
+const WORKER_SOURCE = `
+import * as tts from "${TTS_URL}";
+let session = null, currentVoice = null;
+
+async function prepare(voiceId) {
+    if (session && currentVoice === voiceId) return;
+    const stored = await tts.stored();
+    if (!stored.includes(voiceId)) {
+        await tts.download(voiceId, p => postMessage({ type: "download", loaded: p.loaded, total: p.total }));
+    }
+    postMessage({ type: "loading" });
+    session = null;
+    if (tts.TtsSession) {
+        tts.TtsSession._instance = null;           // start a fresh session for this voice
+        session = await tts.TtsSession.create({ voiceId });
+    }
+    currentVoice = voiceId;
+}
+
+async function speak(text) {
+    const wav = session ? await session.predict(text)
+                        : await tts.predict({ text, voiceId: currentVoice });
+    return await wav.arrayBuffer();
+}
+
+self.onmessage = async (e) => {
+    const { id, type } = e.data;
+    try {
+        if (type === "prepare") {
+            try { await prepare(e.data.voiceId); }
+            catch (err) {
+                // A half-downloaded voice can't load: remove it so the next try downloads it cleanly
+                if (/protobuf|onnx|model|parse|invalid|corrupt/i.test(String(err && err.message))) {
+                    try { await tts.remove(e.data.voiceId); } catch (x) {}
+                }
+                session = null; currentVoice = null;
+                throw err;
+            }
+            postMessage({ id, type: "done" });
+        } else if (type === "speak") {
+            const buf = await speak(e.data.text);
+            postMessage({ id, type: "done", buf }, [buf]);
+        }
+    } catch (err) {
+        postMessage({ id, type: "error", message: String((err && err.message) || err) });
+    }
+};
+postMessage({ type: "started" });
+`;
+
+class WorkerEngine {
+    constructor() {
+        this.pending = new Map();
+        this.seq = 0;
+        this.onEvent = () => {};
+        const url = URL.createObjectURL(new Blob([WORKER_SOURCE], { type: "text/javascript" }));
+        this.worker = new Worker(url, { type: "module" });
+        this.started = new Promise((resolve, reject) => {
+            this.worker.onerror = (e) => {
+                e.preventDefault && e.preventDefault();
+                const err = new Error("worker-failed");
+                reject(err);
+                this.pending.forEach(p => p.reject(err));
+                this.pending.clear();
+            };
+            this.worker.onmessage = (e) => {
+                const m = e.data;
+                if (m.type === "started") return resolve();
+                if (m.id && this.pending.has(m.id)) {
+                    const p = this.pending.get(m.id);
+                    this.pending.delete(m.id);
+                    m.type === "error" ? p.reject(new Error(m.message)) : p.resolve(m.buf);
+                } else {
+                    this.onEvent(m);
+                }
+            };
+        });
+    }
+    call(message) {
+        return new Promise((resolve, reject) => {
+            const id = ++this.seq;
+            this.pending.set(id, { resolve, reject });
+            this.worker.postMessage({ ...message, id });
+        });
+    }
+    async prepare(voiceId) { await this.started; return this.call({ type: "prepare", voiceId }); }
+    async speak(text) { return this.call({ type: "speak", text }); }
+    stop() {
+        this.worker.terminate();
+        const err = new Error("cancelled");
+        this.pending.forEach(p => p.reject(err));
+        this.pending.clear();
+    }
+}
+
+class PageEngine {                       // fallback: same engine, on the page itself
+    constructor() { this.onEvent = () => {}; this.session = null; this.voice = null; }
+    async prepare(voiceId) {
+        const tts = await import(TTS_URL);
+        this.tts = tts;
+        if (this.session && this.voice === voiceId) return;
+        const stored = await tts.stored();
+        if (!stored.includes(voiceId)) {
+            await tts.download(voiceId, p => this.onEvent({ type: "download", loaded: p.loaded, total: p.total }));
+        }
+        this.onEvent({ type: "loading" });
+        this.session = null;
+        if (tts.TtsSession) {
+            tts.TtsSession._instance = null;
+            this.session = await tts.TtsSession.create({ voiceId });
+        }
+        this.voice = voiceId;
+    }
+    async speak(text) {
+        const wav = this.session ? await this.session.predict(text)
+                                 : await this.tts.predict({ text, voiceId: this.voice });
+        return await wav.arrayBuffer();
+    }
+    stop() {}
+}
+
+async function getEngine(voiceId) {
+    if (engine) {
+        await engine.prepare(voiceId);
+        return engine;
+    }
+    try {
+        engine = new WorkerEngine();
+        engine.onEvent = handleEngineEvent;
+        await engine.prepare(voiceId);
+    } catch (err) {
+        if (err.message !== "worker-failed") throw err;
+        engine = new PageEngine();           // this browser can't run the worker: use the page
+        engine.onEvent = handleEngineEvent;
+        await engine.prepare(voiceId);
+    }
+    return engine;
+}
+
+
+/* ---------- Progress, slow-connection watch, screen wake lock ---------- */
+
+let lastActivity = 0;
+let watchTimer = null;
+let wakeLock = null;
+let downloadLabel = "";
+
+function markActivity() { lastActivity = Date.now(); }
+
+function handleEngineEvent(m) {
+    markActivity();
+    if (m.type === "download") {
+        if (m.total) {
+            const pct = Math.round(m.loaded * 100 / m.total);
+            setProgress(pct * 0.25);
+            setStatus(downloadLabel + ": " + pct + "% (" + (m.loaded / 1048576).toFixed(0) +
+                      " of " + (m.total / 1048576).toFixed(0) + " MB)");
+        } else {
+            setStatus(downloadLabel + ": " + (m.loaded / 1048576).toFixed(1) + " MB");
+        }
+    } else if (m.type === "loading") {
+        setProgress(26);
+        setStatus("Loading the voice...");
+    }
+}
+
+function startWatch() {
+    markActivity();
+    clearInterval(watchTimer);
+    watchTimer = setInterval(() => {
+        const quiet = (Date.now() - lastActivity) / 1000;
+        if (quiet > 30 && !/still working/.test(statusBox.textContent)) {
+            statusBox.textContent += navigator.onLine
+                ? " — still working, the connection is slow. You can wait or tap Cancel and try again."
+                : " — still working, but you seem to be offline.";
+        }
+    }, 5000);
+}
+
+function stopWatch() { clearInterval(watchTimer); watchTimer = null; }
+
+async function keepScreenOn() {
+    try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); }
+    catch (e) { wakeLock = null; }
+}
+
+function releaseScreen() {
+    try { if (wakeLock) wakeLock.release(); } catch (e) {}
+    wakeLock = null;
+}
+
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && watchTimer && !wakeLock) keepScreenOn();
+});
+
+function cancelAudio() {
+    cancelled = true;
+    if (engine) { engine.stop(); engine = null; }   // a new engine starts next time
+    setStatus("Cancelled.");
+    progressBar.hidden = true;
+}
+
+window.cancelAudio = cancelAudio;
+
+function formatTime(sec) {
+    sec = Math.max(1, Math.round(sec));
+    return sec < 60 ? sec + " s" : Math.floor(sec / 60) + " min " + (sec % 60) + " s";
 }
 
 function loadLame() {
@@ -849,10 +1209,11 @@ let decodeContext = null;
 async function wavToSamples(wavBlob) {
     if (!decodeContext) {
         const AC = window.AudioContext || window.webkitAudioContext;
-        try { decodeContext = new AC({ sampleRate: 22050 }); }
+        try { decodeContext = new AC({ sampleRate: 24000 }); }
         catch (e) { decodeContext = new AC(); }
     }
-    const buffer = await decodeContext.decodeAudioData(await wavBlob.arrayBuffer());
+    const data = wavBlob instanceof ArrayBuffer ? wavBlob : await wavBlob.arrayBuffer();
+    const buffer = await decodeContext.decodeAudioData(data);
     return { samples: buffer.getChannelData(0), sampleRate: buffer.sampleRate };
 }
 
@@ -866,7 +1227,7 @@ function floatTo16Bit(floats) {
 }
 
 async function encodeMp3(int16, sampleRate, lamejs) {
-    const encoder = new lamejs.Mp3Encoder(1, sampleRate, 64);   // 64 kbps is clear for speech and keeps files small
+    const encoder = new lamejs.Mp3Encoder(1, sampleRate, 48);   // 48 kbps, 24 kHz mono: same format as FFmpeg-made speech MP3s
     const blockSize = 1152;
     const parts = [];
 
@@ -900,43 +1261,48 @@ async function downloadAudio() {
     const voiceName = studioVoice.options[studioVoice.selectedIndex].textContent.replace(/^\S+\s/, "");
 
     mp3Button.disabled = true;
+    cancelButton.hidden = false;
+    cancelled = false;
     result.innerHTML = "";
     setProgress(0);
+    downloadLabel = "Downloading " + voiceName + " (first time only)";
+    startWatch();
+    keepScreenOn();
 
     try {
-        setStatus("Loading the voice engine...");
-        const tts = await loadTTS();
-        const lamejs = await loadLame();
+        setStatus("Starting the voice engine...");
+        const lamejsPromise = loadLame();             // loads while the voice gets ready
 
-        // 1. Download the voice the first time (stored on the device afterwards)
-        const stored = await tts.stored();
-        if (!stored.includes(voiceId)) {
-            await tts.download(voiceId, p => {
-                if (p.total) {
-                    const pct = Math.round(p.loaded * 100 / p.total);
-                    setProgress(pct * 0.3);
-                    setStatus("Downloading " + voiceName + " (first time only): " + pct + "%");
-                } else {
-                    setStatus("Downloading " + voiceName + " (first time only): " +
-                              (p.loaded / 1048576).toFixed(1) + " MB");
-                }
-            });
-        }
+        // 1. Get the voice ready (downloads once, then stays on the device)
+        const tts = await getEngine(voiceId);
+        const lamejs = await lamejsPromise;
 
-        // 2. Generate speech piece by piece
-        const pieces = splitIntoChunks(value, 400);
+        // 2. Generate speech piece by piece in the background
+        const pieces = splitIntoChunks(value, 500);
+        const totalChars = pieces.reduce((n, p) => n + p.length, 0);
         const audioParts = [];
-        let sampleRate = 22050;
+        let sampleRate = 24000;
+        let doneChars = 0;
+        const started = Date.now();
 
         for (let i = 0; i < pieces.length; i++) {
-            setStatus("Creating audio... part " + (i + 1) + " of " + pieces.length);
-            setProgress(30 + 55 * (i / pieces.length));
-            await nextFrame();
+            if (cancelled) return;
 
-            const wav = await tts.predict({ text: pieces[i], voiceId });
-            const decoded = await wavToSamples(wav);
+            let message = "Creating audio... part " + (i + 1) + " of " + pieces.length;
+            if (doneChars > 0) {
+                const perChar = (Date.now() - started) / 1000 / doneChars;
+                message += " — about " + formatTime(perChar * (totalChars - doneChars)) + " left";
+            }
+            setStatus(message);
+            setProgress(28 + 56 * (doneChars / totalChars));
+            markActivity();
+
+            const wavBuffer = await tts.speak(pieces[i]);
+            if (cancelled) return;
+            const decoded = await wavToSamples(wavBuffer);
             sampleRate = decoded.sampleRate;
             audioParts.push(decoded.samples);
+            doneChars += pieces[i].length;
         }
 
         // 3. Join the pieces with a short pause between them
@@ -949,16 +1315,43 @@ async function downloadAudio() {
             offset += part.length + (i < audioParts.length - 1 ? pause : 0);
         });
 
-        // 4. Encode to MP3
+        // 4. Even out the volume (about -16 LUFS, peaks kept below -1 dB)
+        setStatus("Adjusting the volume...");
+        setProgress(84);
+        await nextFrame();
+        const levelled = normalizeSpeech(joined, sampleRate);
+
+        // 5. Encode to MP3
         setStatus("Converting to MP3...");
         setProgress(85);
-        const mp3 = await encodeMp3(floatTo16Bit(joined), sampleRate, lamejs);
+        const encoded = await encodeMp3(floatTo16Bit(levelled), sampleRate, lamejs);
+        const audioBytes = new Uint8Array(await encoded.arrayBuffer());
 
-        // 5. Offer the file
+        // 6. Add the two pieces FFmpeg adds: the ID3 tag and the "Info" length header
+        const durationMs = Math.round(total / sampleRate * 1000);
+        const titleInput = document.getElementById("mp3Title");
+        const firstLine = (value.split(/\n/).find(l => l.trim()) || "Study notes").trim();
+        const title = (titleInput.value.trim() || firstLine).slice(0, 80);
+        const lang = (typeof language !== "undefined" && language === "fr") ? "fra" : "eng";
+
+        const id3 = buildId3({
+            TIT2: title,
+            TPE1: "StudyVoice Pro",
+            TALB: "Study notes",
+            TLAN: lang,
+            TLEN: String(durationMs),
+            TSSE: "StudyVoice Pro (LAME via lamejs)"
+        });
+        const info = buildInfoFrame(audioBytes, sampleRate);
+        const mp3 = new Blob([id3, info, audioBytes], { type: "audio/mpeg" });
+
+        // 7. Offer the file
         if (lastUrl) URL.revokeObjectURL(lastUrl);
         lastUrl = URL.createObjectURL(mp3);
 
-        const fileName = "studyvoice-" + new Date().toISOString().slice(0, 10) + ".mp3";
+        const safeName = title.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+                              .replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 40) || "studyvoice";
+        const fileName = safeName + ".mp3";
         const minutes = Math.floor(total / sampleRate / 60);
         const seconds = Math.round(total / sampleRate % 60);
 
@@ -979,8 +1372,10 @@ async function downloadAudio() {
         setStatus("MP3 ready: " + minutes + " min " + seconds + " s. If the download didn't start, tap the link below the player.");
 
     } catch (error) {
+        if (cancelled) return;
         console.error(error);
         progressBar.hidden = true;
+        if (engine) { engine.stop(); engine = null; }   // start clean on the next try
 
         let message = "The MP3 could not be created. ";
         if (location.protocol === "file:") {
@@ -995,6 +1390,9 @@ async function downloadAudio() {
 
     } finally {
         mp3Button.disabled = false;
+        cancelButton.hidden = true;
+        stopWatch();
+        releaseScreen();
     }
 }
 
